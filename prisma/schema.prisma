@@ -1,0 +1,338 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+  // url lives in prisma.config.ts (Prisma 7)
+}
+
+// ---------- Enums (fixed vocabularies only — statuses/sources/categories are OrgList data) ----------
+
+enum Role {
+  ADMIN
+  MANAGER
+  AGENT
+}
+
+enum Priority {
+  HIGH
+  MEDIUM
+  LOW
+}
+
+enum VisitStatus {
+  SCHEDULED
+  COMPLETED
+  CANCELLED
+  NO_SHOW
+}
+
+enum Availability {
+  AVAILABLE
+  UNDER_CONSTRUCTION
+  SOLD
+  RESERVED
+}
+
+enum TaskStatus {
+  OPEN
+  DONE
+}
+
+enum ActivityType {
+  NOTE
+  CALL
+  STATUS_CHANGE
+  ASSIGNMENT
+  VISIT
+  MESSAGE
+  FOLLOW_UP
+  SYSTEM
+}
+
+enum ListKind {
+  LEAD_SOURCE
+  LEAD_STATUS
+  PROPERTY_CATEGORY
+  SHIFT
+}
+
+// ---------- Tenancy seam ----------
+
+model Org {
+  id        String   @id @default(cuid())
+  name      String
+  currency  String   @default("USD") // ISO 4217
+  locale    String   @default("en-US")
+  timezone  String   @default("UTC")
+  createdAt DateTime @default(now())
+
+  // Automation config (single-brokerage settings live inline on the org)
+  autoAssign    Boolean @default(false) // round-robin/least-loaded new leads to agents
+  staleLeadDays Int     @default(7) // flag leads with no activity in N days
+  ingestKey     String? @unique // API key for portal/website lead ingestion
+
+  users         User[]
+  leads         Lead[]
+  properties    Property[]
+  siteVisits    SiteVisit[]
+  activities    Activity[]
+  tasks         Task[]
+  notifications Notification[]
+  auditLogs      AuditLog[]
+  lists          OrgList[]
+  savedViews     SavedView[]
+  automationRuns AutomationRun[]
+}
+
+// One row per automation-tick invocation — the monitor's system of record.
+model AutomationRun {
+  id                String   @id @default(cuid())
+  orgId             String
+  trigger           String // "cron" | "manual" | "loop"
+  followupReminders Int      @default(0)
+  staleFlagged      Int      @default(0)
+  autoAssigned      Int      @default(0)
+  durationMs        Int      @default(0)
+  createdAt         DateTime @default(now())
+
+  org Org @relation(fields: [orgId], references: [id])
+
+  @@index([orgId, createdAt])
+}
+
+// Per-user (or shared) named filter presets. Filter state is a URL query string.
+model SavedView {
+  id        String   @id @default(cuid())
+  orgId     String
+  ownerId   String
+  name      String
+  resource  String // "lead" | "property"
+  query     String // serialized URLSearchParams, e.g. "status=new&priority=HIGH"
+  shared    Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  org   Org  @relation(fields: [orgId], references: [id])
+  owner User @relation("SavedViewOwner", fields: [ownerId], references: [id])
+
+  @@index([orgId, resource])
+}
+
+// Configurable vocabularies: lead sources, lead statuses (pipeline), property categories, shifts.
+model OrgList {
+  id       String   @id @default(cuid())
+  orgId    String
+  kind     ListKind
+  value    String // machine key, e.g. "site_visit"
+  label    String // display, e.g. "Site Visit"
+  color    String? // UI accent hex
+  order    Int      @default(0)
+  isActive Boolean  @default(true)
+  meta     Json? // e.g. { "won": true } / { "lost": true } on LEAD_STATUS
+
+  org Org @relation(fields: [orgId], references: [id])
+
+  @@unique([orgId, kind, value])
+  @@index([orgId, kind])
+}
+
+// ---------- People ----------
+
+model User {
+  id           String    @id @default(cuid())
+  orgId        String
+  name         String
+  email        String    @unique
+  passwordHash String
+  role         Role      @default(AGENT)
+  phone        String?
+  avatarUrl    String?
+  isActive     Boolean   @default(true)
+  shift        String? // OrgList SHIFT value
+  targets      Json? // e.g. { "monthlyConversions": 5, "monthlyRevenue": 5000000 }
+  createdAt    DateTime  @default(now())
+  deletedAt    DateTime?
+
+  org            Org            @relation(fields: [orgId], references: [id])
+  leads          Lead[]         @relation("LeadAssignee")
+  siteVisits     SiteVisit[]    @relation("VisitAssignee")
+  activities     Activity[]     @relation("ActivityActor")
+  tasks          Task[]         @relation("TaskAssignee")
+  notifications  Notification[] @relation("NotificationRecipient")
+  auditLogs      AuditLog[]     @relation("AuditActor")
+  savedViews     SavedView[]    @relation("SavedViewOwner")
+
+  @@index([orgId])
+}
+
+// ---------- Core CRM ----------
+
+model Lead {
+  id             String    @id @default(cuid())
+  orgId          String
+  name           String
+  email          String?
+  phone          String?
+  status         String    @default("new") // OrgList LEAD_STATUS value
+  priority       Priority  @default(MEDIUM)
+  source         String? // OrgList LEAD_SOURCE value
+  budget         Decimal?  @db.Decimal(14, 2)
+  propertyType   String? // OrgList PROPERTY_CATEGORY value
+  assignedToId   String?
+  followUpDueAt  DateTime?
+  lostReason     String?
+  notes          String?
+  tags           String[]  @default([]) // free-form labels (project/campaign)
+
+  // AI lead scoring (Claude-generated; source flag distinguishes from manual)
+  score          Int? // 0-100
+  scoreBand      String? // HOT | WARM | COLD
+  intent         String? // buyer | investor | renter | unknown
+  nextAction     String? // suggested next step
+  scoreReason    String? // one-line rationale
+  scoredAt       DateTime?
+
+  // Ingestion provenance
+  dedupeKey      String? // stable upstream key, e.g. "portal:99acres:12345"
+  externalSource String? // e.g. "99acres", "facebook", "website"
+
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  deletedAt      DateTime?
+
+  org        Org        @relation(fields: [orgId], references: [id])
+  assignedTo User?      @relation("LeadAssignee", fields: [assignedToId], references: [id])
+  visits     SiteVisit[]
+  activities Activity[]
+
+  @@unique([orgId, dedupeKey])
+  @@index([orgId, status])
+  @@index([orgId, assignedToId])
+  @@index([orgId, followUpDueAt])
+  @@index([orgId, scoreBand])
+  @@index([tags], type: Gin)
+  @@index([orgId, phone])
+  @@index([orgId, email])
+}
+
+model Property {
+  id          String       @id @default(cuid())
+  orgId       String
+  title       String
+  description String?
+  category    String // OrgList PROPERTY_CATEGORY value
+  price       Decimal      @db.Decimal(14, 2)
+  area        Int? // sqft
+  location    String?
+  geoLat      Float?
+  geoLng      Float?
+  bedrooms    Int?
+  bathrooms   Int?
+  amenities   String[]     @default([])
+  availability Availability @default(AVAILABLE)
+  images      String[]     @default([])
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+
+  org    Org         @relation(fields: [orgId], references: [id])
+  visits SiteVisit[]
+
+  @@index([orgId, category])
+  @@index([orgId, availability])
+}
+
+model SiteVisit {
+  id           String      @id @default(cuid())
+  orgId        String
+  leadId       String
+  propertyId   String
+  assignedToId String
+  scheduledAt  DateTime
+  status       VisitStatus @default(SCHEDULED)
+  outcome      String? // post-visit outcome note
+  notes        String?
+  createdAt    DateTime    @default(now())
+  updatedAt    DateTime    @updatedAt
+  deletedAt    DateTime?
+
+  org        Org      @relation(fields: [orgId], references: [id])
+  lead       Lead     @relation(fields: [leadId], references: [id])
+  property   Property @relation(fields: [propertyId], references: [id])
+  assignedTo User     @relation("VisitAssignee", fields: [assignedToId], references: [id])
+
+  @@index([orgId, scheduledAt])
+  @@index([orgId, assignedToId, scheduledAt])
+  @@index([orgId, status])
+}
+
+// System of record for everything that happened on a lead.
+model Activity {
+  id        String       @id @default(cuid())
+  orgId     String
+  leadId    String
+  type      ActivityType
+  actorId   String?
+  payload   Json // shape depends on type, e.g. { from, to } for STATUS_CHANGE, { text } for NOTE
+  createdAt DateTime     @default(now())
+
+  org   Org   @relation(fields: [orgId], references: [id])
+  lead  Lead  @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  actor User? @relation("ActivityActor", fields: [actorId], references: [id])
+
+  @@index([orgId, leadId, createdAt])
+}
+
+model Task {
+  id           String     @id @default(cuid())
+  orgId        String
+  title        String
+  dueAt        DateTime?
+  status       TaskStatus @default(OPEN)
+  assignedToId String
+  linkedType   String? // "lead" | "property" | "visit"
+  linkedId     String?
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+
+  org        Org  @relation(fields: [orgId], references: [id])
+  assignedTo User @relation("TaskAssignee", fields: [assignedToId], references: [id])
+
+  @@index([orgId, assignedToId, status, dueAt])
+}
+
+model Notification {
+  id          String   @id @default(cuid())
+  orgId       String
+  recipientId String
+  type        String // e.g. "lead_assigned", "visit_reminder", "followup_due"
+  channel     String   @default("in_app")
+  read        Boolean  @default(false)
+  payload     Json // { title, body, href }
+  createdAt   DateTime @default(now())
+
+  org       Org  @relation(fields: [orgId], references: [id])
+  recipient User @relation("NotificationRecipient", fields: [recipientId], references: [id])
+
+  @@index([orgId, recipientId, read, createdAt])
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  orgId     String
+  actorId   String?
+  action    String // e.g. "lead.update", "auth.login", "user.role_change"
+  entity    String
+  entityId  String?
+  before    Json?
+  after     Json?
+  createdAt DateTime @default(now())
+
+  org   Org   @relation(fields: [orgId], references: [id])
+  actor User? @relation("AuditActor", fields: [actorId], references: [id])
+
+  @@index([orgId, createdAt])
+  @@index([orgId, entity, entityId])
+}
